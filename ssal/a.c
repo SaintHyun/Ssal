@@ -2,5 +2,5 @@
 
 int main()
 {
-    printf("SSAL\n");
+    printf("Sibal\n");
 }
