@@ -33,8 +33,8 @@
 #define TIMEOUT_US 200000
 
 // ================== NEC IR config ==================
-#define IR_CARRIER_HZ 38000
-#define IR_DUTY_PER_MILL 330000 // ~33% (0..1,000,000)
+#define IR_CARRIER_HZ    56000
+#define IR_DUTY_PER_MILL 300000 // ~33% (0..1,000,000)
 
 // For toggle safety keep a single press by default
 #define IR_REPEAT_COUNT 1
