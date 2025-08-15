@@ -50,7 +50,7 @@
 
 // ---- FILL THESE WITH YOUR CAPTURED CODES ----
 #define NEC_ADDR 0x00       // <<< replace with your fan's NEC address (8-bit)
-#define NEC_CMD_TOGGLE 0x02 // <<< replace with your fan's POWER (toggle) command (8-bit)
+#define NEC_CMD_TOGGLE 0x45 // <<< replace with your fan's POWER (toggle) command (8-bit)
 // ---------------------------------------------
 
 static volatile int keep_running = 1;
