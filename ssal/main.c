@@ -63,26 +63,6 @@ static void iso_timestamp(char *buf, size_t len)
   strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
-static inline void carrier_burst_ms(int ms)
-{
-  gpioHardwarePWM(IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL);
-  gpioDelay(ms * 1000);
-  gpioHardwarePWM(IR_PIN, 0, 0);
-}
-
-static int is_cmd_eq(const char *s, const char *t)
-{
-  size_t n = strlen(s), m = strlen(t);
-  if (n != m)
-    return 0;
-  for (size_t i = 0; i < n; i++)
-  {
-    if ((char)tolower((unsigned char)s[i]) != (char)tolower((unsigned char)t[i]))
-      return 0;
-  }
-  return 1;
-}
-
 // Non-blocking read of a full line from stdin if available.
 // Returns 1 if a line was read into buf (stripped of trailing newline), 0 otherwise.
 static int stdin_readline(char *buf, size_t len)
@@ -300,31 +280,23 @@ int main(void)
     char line[128];
     while (stdin_readline(line, sizeof line))
     {
-      if (is_cmd_eq(line, "test") || is_cmd_eq(line, "nec"))
+      if (is_cmd_test(line))
       {
         char ts[32];
         iso_timestamp(ts, sizeof ts);
-        // NEC 한 프레임 전송 (토글)
         fan_send_toggle();
-        // 로컬 상태 반전
-        fan_on = !fan_on;
+        fan_on = !fan_on; // assume success to keep local state consistent
         if (logf)
         {
           fprintf(logf, "%s,,,%d,MANUAL_TOGGLE\n", ts, fan_on ? 1 : 0);
           fflush(logf);
         }
-        printf("[%s] MANUAL: sent NEC TOGGLE  addr=0x%02X cmd=0x%02X  FAN=%d\n",
-               ts, NEC_ADDR, NEC_CMD_TOGGLE, fan_on);
-      }
-      else if (is_cmd_eq(line, "car"))
-      {
-        // 38kHz 캐리어만 300ms 쏘기 (IR 데이터 없이) -> 카메라로 발광 확인용
-        carrier_burst_ms(300);
-        printf("Manual: 38kHz carrier burst 300ms sent on GPIO%d\n", IR_PIN);
+        printf("[%s] MANUAL: sent IR TOGGLE. FAN=%d\n", ts, fan_on);
       }
       else
       {
-        printf("Unknown cmd: %s  (use: test|nec|car)\n", line);
+        // Unknown command; ignore quietly (or print help)
+        // printf("Unknown command: %s\n", line);
       }
     }
 
