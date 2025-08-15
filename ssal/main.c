@@ -1,17 +1,7 @@
-// main.c - RPi 3B+ + DHT22 + pigpio + IR (NEC, POWER TOGGLE only) fan control + CSV logging
-// BCM numbering. Requires sudo.
+// main.c - RPi 3B+ + DHT22 + pigpio + IR (NEC, POWER TOGGLE only) + CSV logging
+// Adds: type "test" + Enter in the same terminal to send a manual IR toggle.
 // Build: make
 // Run:   sudo ./tempctrl
-//
-// Notes:
-// - NEC remote with only POWER TOGGLE available.
-// - We use an "arming" strategy to avoid desync on boot: no IR is sent until temperature first
-//   drops into the "OFF band" (<= COOL_OFF_C). After armed, we send toggle only on threshold crossings.
-// - You MUST fill NEC_ADDR and NEC_CMD_TOGGLE with your remote's captured values.
-//
-// Hardware:
-// - IR LED on BCM18 (hardware PWM). Drive via NPN transistor + series resistor. Do NOT drive LED directly.
-// - DHT22 on BCM4 with 10k pull-up to 3.3V.
 
 #include <pigpio.h>
 #include <stdio.h>
@@ -21,6 +11,9 @@
 #include <time.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <ctype.h>
 
 // ================== Pins (BCM) ==================
 #define DHT_PIN 4
@@ -30,7 +23,7 @@
 #define COOL_ON_C 28.0f
 #define COOL_OFF_C 26.0f
 
-// Require arming pass (enter <= COOL_OFF_C once before sending any IR)
+// Require arming pass (enter <= COOL_OFF_C once before auto IR)
 #define REQUIRE_ARMING 1
 
 // Loop period (seconds)
@@ -43,14 +36,14 @@
 #define IR_CARRIER_HZ 38000
 #define IR_DUTY_PER_MILL 330000 // ~33% (0..1,000,000)
 
-// Send exactly one full NEC frame per action to avoid double toggles
+// For toggle safety keep a single press by default
 #define IR_REPEAT_COUNT 1
 #define IR_REPEAT_GAP_US 40000
-#define USE_NEC_REPEAT_FRAME 0 // keep 0 for power toggle
+#define USE_NEC_REPEAT_FRAME 0
 
 // ---- FILL THESE WITH YOUR CAPTURED CODES ----
-#define NEC_ADDR 0x00       // <<< replace with your fan's NEC address (8-bit)
-#define NEC_CMD_TOGGLE 0x45 // <<< replace with your fan's POWER (toggle) command (8-bit)
+#define NEC_ADDR 0x00       // <<< put your remote's NEC address
+#define NEC_CMD_TOGGLE 0x02 // <<< put your remote's POWER (toggle)
 // ---------------------------------------------
 
 static volatile int keep_running = 1;
@@ -68,6 +61,45 @@ static void iso_timestamp(char *buf, size_t len)
   struct tm tmv;
   localtime_r(&t, &tmv);
   strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+// Non-blocking read of a full line from stdin if available.
+// Returns 1 if a line was read into buf (stripped of trailing newline), 0 otherwise.
+static int stdin_readline(char *buf, size_t len)
+{
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(STDIN_FILENO, &rfds);
+  struct timeval tv = {0, 0}; // non-blocking
+  int r = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+  if (r > 0 && FD_ISSET(STDIN_FILENO, &rfds))
+  {
+    if (fgets(buf, (int)len, stdin))
+    {
+      size_t n = strlen(buf);
+      while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+      {
+        buf[--n] = '\0';
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Case-insensitive equality to "test"
+static int is_cmd_test(const char *s)
+{
+  const char *t = "test";
+  size_t n = strlen(s);
+  if (n != 4)
+    return 0;
+  for (size_t i = 0; i < 4; i++)
+  {
+    if ((char)tolower((unsigned char)s[i]) != t[i])
+      return 0;
+  }
+  return 1;
 }
 
 // ===== DHT22 helpers =====
@@ -181,8 +213,6 @@ static void ir_send_nec_frame(uint8_t addr, uint8_t cmd)
       v >>= 1;
     }
   }
-
-  // End
   ir_mark(NEC_END_MARK);
 }
 
@@ -195,7 +225,6 @@ static void ir_send_nec_repeat(void)
 
 static void ir_send_nec(uint8_t addr, uint8_t cmd)
 {
-  // Send exactly one press; repeat disabled by default for toggle safety
   ir_send_nec_frame(addr, cmd);
   ir_space(IR_REPEAT_GAP_US);
 
@@ -241,11 +270,37 @@ int main(void)
     fflush(logf);
   }
 
-  bool armed = (REQUIRE_ARMING == 0); // if arming disabled, start armed
-  bool fan_on = false;                // our believed state (may differ from reality until armed)
+  bool armed = (REQUIRE_ARMING == 0);
+  bool fan_on = false;
 
   while (keep_running)
   {
+    // ---------- 1) Handle manual input (non-blocking) ----------
+    // Drain all pending lines to avoid backlog
+    char line[128];
+    while (stdin_readline(line, sizeof line))
+    {
+      if (is_cmd_test(line))
+      {
+        char ts[32];
+        iso_timestamp(ts, sizeof ts);
+        fan_send_toggle();
+        fan_on = !fan_on; // assume success to keep local state consistent
+        if (logf)
+        {
+          fprintf(logf, "%s,,,%d,MANUAL_TOGGLE\n", ts, fan_on ? 1 : 0);
+          fflush(logf);
+        }
+        printf("[%s] MANUAL: sent IR TOGGLE. FAN=%d\n", ts, fan_on);
+      }
+      else
+      {
+        // Unknown command; ignore quietly (or print help)
+        // printf("Unknown command: %s\n", line);
+      }
+    }
+
+    // ---------- 2) Sensor read ----------
     float t = 0.0f, h = 0.0f;
     int rc = dht22_read(DHT_PIN, &t, &h);
 
@@ -254,23 +309,23 @@ int main(void)
 
     if (rc == 0)
     {
+      // ---------- 3) Auto control ----------
       if (!armed)
       {
         if (t <= COOL_OFF_C)
-          armed = true; // armed after entering OFF band once
+          armed = true;
       }
       else
       {
-        // Hysteresis with POWER TOGGLE
         if (!fan_on && t >= COOL_ON_C)
         {
           fan_send_toggle();
-          fan_on = true; // assume success
+          fan_on = true;
         }
         else if (fan_on && t <= COOL_OFF_C)
         {
           fan_send_toggle();
-          fan_on = false; // assume success
+          fan_on = false;
         }
       }
 
@@ -285,7 +340,6 @@ int main(void)
     }
     else
     {
-      // Sensor read failed -> do not send IR (can't infer safe action)
       if (logf)
       {
         fprintf(logf, "%s,,,%d,READ_FAIL(%d)\n", ts, fan_on ? 1 : 0, rc);
@@ -294,12 +348,13 @@ int main(void)
       fprintf(stderr, "[%s] DHT22 read failed rc=%d\n", ts, rc);
     }
 
-    // Sleep in slices to respond to signals
+    // ---------- 4) Sleep (in slices) ----------
     for (int i = 0; i < LOOP_PERIOD_S * 10 && keep_running; i++)
       gpioDelay(100000);
   }
 
   gpioHardwarePWM(IR_PIN, 0, 0);
+  // flush stdin (not necessary)
   if (logf)
     fclose(logf);
   gpioTerminate();
