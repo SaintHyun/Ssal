@@ -1,7 +1,11 @@
 // main.c - RPi 3B+ + DHT22 + pigpio + IR (NEC, POWER TOGGLE only) + CSV logging
-// Adds: type "test" + Enter in the same terminal to send a manual IR toggle.
+// Adds: non-blocking stdin commands ("test", "nec", "car"),
+//       2-A: longer timeout, 60us threshold, 3x retry with delay,
+//       2-B: request real-time scheduling (SCHED_FIFO).
+//
 // Build: make
 // Run:   sudo ./tempctrl
+// (Optionally) sudo chrt -f 80 ./tempctrl  // external RT, if kernel denies in-code set
 
 #include <pigpio.h>
 #include <stdio.h>
@@ -14,36 +18,37 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <ctype.h>
+#include <sched.h> // 2-B: real-time scheduling
+#include <errno.h>
 
 // ================== Pins (BCM) ==================
 #define DHT_PIN 4
-#define IR_PIN 18
+#define IR_PIN 18 // use BCM18 (physical pin 12)
 
 // ================== Control (hysteresis) ==================
 #define COOL_ON_C 28.0f
 #define COOL_OFF_C 26.0f
-
-// Require arming pass (enter <= COOL_OFF_C once before auto IR)
 #define REQUIRE_ARMING 1
 
 // Loop period (seconds)
 #define LOOP_PERIOD_S 2
 
-// DHT22 timeout (microseconds)
-#define TIMEOUT_US 200000
+// ================== DHT22 timing (2-A) ==================
+#define TIMEOUT_US 300000      // was 200000 -> 300000
+#define DHT_THRESHOLD_US 60    // was ~50, safer split between ~28 and ~70
+#define DHT_RETRIES 3          // retry count on failure
+#define DHT_RETRY_DELAY_MS 150 // delay between retries
 
 // ================== NEC IR config ==================
 #define IR_CARRIER_HZ 38000
 #define IR_DUTY_PER_MILL 330000 // ~33% (0..1,000,000)
-
-// For toggle safety keep a single press by default
-#define IR_REPEAT_COUNT 1
+#define IR_REPEAT_COUNT 1       // keep a single press for toggle safety
 #define IR_REPEAT_GAP_US 40000
 #define USE_NEC_REPEAT_FRAME 0
 
 // ---- FILL THESE WITH YOUR CAPTURED CODES ----
 #define NEC_ADDR 0x00       // <<< put your remote's NEC address
-#define NEC_CMD_TOGGLE 0x45 // <<< put your remote's POWER (toggle)
+#define NEC_CMD_TOGGLE 0x02 // <<< put your remote's POWER (toggle)
 // ---------------------------------------------
 
 static volatile int keep_running = 1;
@@ -63,8 +68,23 @@ static void iso_timestamp(char *buf, size_t len)
   strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
-// Non-blocking read of a full line from stdin if available.
-// Returns 1 if a line was read into buf (stripped of trailing newline), 0 otherwise.
+// 2-B: request SCHED_FIFO; failure is non-fatal (kernel may deny without CAP_SYS_NICE)
+static void try_set_realtime(int prio)
+{
+  struct sched_param sp;
+  sp.sched_priority = prio;
+  if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+  {
+    fprintf(stderr, "sched_setscheduler(SCHED_FIFO,%d) failed: %s\n",
+            prio, strerror(errno));
+  }
+  else
+  {
+    printf("Scheduler set to SCHED_FIFO priority %d\n", prio);
+  }
+}
+
+// ---------- stdin helpers ----------
 static int stdin_readline(char *buf, size_t len)
 {
   fd_set rfds;
@@ -87,22 +107,20 @@ static int stdin_readline(char *buf, size_t len)
   return 0;
 }
 
-// Case-insensitive equality to "test"
-static int is_cmd_test(const char *s)
+static int is_cmd_eq(const char *s, const char *t)
 {
-  const char *t = "test";
-  size_t n = strlen(s);
-  if (n != 4)
+  size_t n = strlen(s), m = strlen(t);
+  if (n != m)
     return 0;
-  for (size_t i = 0; i < 4; i++)
+  for (size_t i = 0; i < n; i++)
   {
-    if ((char)tolower((unsigned char)s[i]) != t[i])
+    if ((char)tolower((unsigned char)s[i]) != (char)tolower((unsigned char)t[i]))
       return 0;
   }
   return 1;
 }
 
-// ===== DHT22 helpers =====
+// ===== DHT22 low-level helpers =====
 static int wait_for_level(unsigned gpio, int level, uint32_t timeout_us)
 {
   uint32_t start = gpioTick();
@@ -114,16 +132,16 @@ static int wait_for_level(unsigned gpio, int level, uint32_t timeout_us)
   return 0;
 }
 
-static int dht22_read(unsigned gpio, float *temp_c, float *rh)
+static int dht22_read_once(unsigned gpio, float *temp_c, float *rh)
 {
   uint8_t data[5] = {0};
 
   // Start signal
   gpioSetMode(gpio, PI_OUTPUT);
   gpioWrite(gpio, 0);
-  gpioDelay(20000);
+  gpioDelay(18000); // 18 ms
   gpioWrite(gpio, 1);
-  gpioDelay(80);
+  gpioDelay(40); // 40 us
 
   // Response
   gpioSetMode(gpio, PI_INPUT);
@@ -139,12 +157,15 @@ static int dht22_read(unsigned gpio, float *temp_c, float *rh)
   for (int i = 0; i < 40; i++)
   {
     if (wait_for_level(gpio, 1, TIMEOUT_US) < 0)
-      return -4;
+      return -4; // HIGH start
     uint32_t start_high = gpioTick();
     if (wait_for_level(gpio, 0, TIMEOUT_US) < 0)
-      return -5;
+      return -5; // HIGH end
     uint32_t high_len = gpioTick() - start_high;
-    int bit = (high_len > 50) ? 1 : 0;
+
+    // 2-A: threshold relaxed to 60us
+    int bit = (high_len > DHT_THRESHOLD_US) ? 1 : 0;
+
     data[i / 8] <<= 1;
     data[i / 8] |= bit;
   }
@@ -169,6 +190,21 @@ static int dht22_read(unsigned gpio, float *temp_c, float *rh)
   return 0;
 }
 
+// 2-A: retry wrapper
+static int dht22_read_retry(unsigned gpio, float *t, float *h)
+{
+  int last = -99;
+  for (int i = 0; i < DHT_RETRIES; i++)
+  {
+    int rc = dht22_read_once(gpio, t, h);
+    if (rc == 0)
+      return 0;
+    last = rc;
+    gpioDelay(DHT_RETRY_DELAY_MS * 1000);
+  }
+  return last;
+}
+
 // ===== NEC IR helpers =====
 #define NEC_HDR_MARK 9000
 #define NEC_HDR_SPACE 4500
@@ -182,14 +218,27 @@ static int dht22_read(unsigned gpio, float *temp_c, float *rh)
 
 static inline void ir_mark(unsigned usec)
 {
-  gpioHardwarePWM(IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL);
+  int rc = gpioHardwarePWM(IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL);
+  if (rc < 0)
+    fprintf(stderr, "PWM mark error rc=%d on GPIO%d\n", rc, IR_PIN);
   gpioDelay(usec);
 }
 
 static inline void ir_space(unsigned usec)
 {
-  gpioHardwarePWM(IR_PIN, 0, 0);
+  int rc = gpioHardwarePWM(IR_PIN, 0, 0);
+  if (rc < 0)
+    fprintf(stderr, "PWM space error rc=%d on GPIO%d\n", rc, IR_PIN);
   gpioDelay(usec);
+}
+
+static inline void carrier_burst_ms(int ms)
+{
+  int rc = gpioHardwarePWM(IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL);
+  if (rc < 0)
+    fprintf(stderr, "PWM mark error rc=%d on GPIO%d\n", rc, IR_PIN);
+  gpioDelay(ms * 1000);
+  gpioHardwarePWM(IR_PIN, 0, 0);
 }
 
 static void ir_send_nec_frame(uint8_t addr, uint8_t cmd)
@@ -257,7 +306,14 @@ int main(void)
     fprintf(stderr, "pigpio init failed\n");
     return 1;
   }
+
+  // 2-B: ask kernel for RT scheduling (non-fatal if denied)
+  try_set_realtime(50);
+
   gpioSetMode(IR_PIN, PI_OUTPUT); // harmless with hardware PWM
+
+  printf("IR cfg: GPIO=%d, carrier=%u Hz, duty=%.1f%%, NEC addr=0x%02X, toggle=0x%02X\n",
+         IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL / 10000.0, NEC_ADDR, NEC_CMD_TOGGLE);
 
   FILE *logf = fopen("log.csv", "a");
   if (!logf)
@@ -275,41 +331,45 @@ int main(void)
 
   while (keep_running)
   {
-    // ---------- 1) Handle manual input (non-blocking) ----------
-    // Drain all pending lines to avoid backlog
+    // ---------- 1) manual commands ----------
     char line[128];
     while (stdin_readline(line, sizeof line))
     {
-      if (is_cmd_test(line))
+      if (is_cmd_eq(line, "test") || is_cmd_eq(line, "nec"))
       {
         char ts[32];
         iso_timestamp(ts, sizeof ts);
         fan_send_toggle();
-        fan_on = !fan_on; // assume success to keep local state consistent
+        fan_on = !fan_on;
         if (logf)
         {
           fprintf(logf, "%s,,,%d,MANUAL_TOGGLE\n", ts, fan_on ? 1 : 0);
           fflush(logf);
         }
-        printf("[%s] MANUAL: sent IR TOGGLE. FAN=%d\n", ts, fan_on);
+        printf("[%s] MANUAL: sent NEC TOGGLE  addr=0x%02X cmd=0x%02X  FAN=%d\n",
+               ts, NEC_ADDR, NEC_CMD_TOGGLE, fan_on);
+      }
+      else if (is_cmd_eq(line, "car"))
+      {
+        carrier_burst_ms(300);
+        printf("Manual: 38kHz carrier burst 300ms sent on GPIO%d\n", IR_PIN);
       }
       else
       {
-        // Unknown command; ignore quietly (or print help)
-        // printf("Unknown command: %s\n", line);
+        printf("Unknown cmd: %s  (use: test|nec|car)\n", line);
       }
     }
 
-    // ---------- 2) Sensor read ----------
+    // ---------- 2) sensor read with retry (2-A) ----------
     float t = 0.0f, h = 0.0f;
-    int rc = dht22_read(DHT_PIN, &t, &h);
+    int rc = dht22_read_retry(DHT_PIN, &t, &h);
 
     char ts[32];
     iso_timestamp(ts, sizeof ts);
 
     if (rc == 0)
     {
-      // ---------- 3) Auto control ----------
+      // ---------- 3) auto control ----------
       if (!armed)
       {
         if (t <= COOL_OFF_C)
@@ -348,13 +408,12 @@ int main(void)
       fprintf(stderr, "[%s] DHT22 read failed rc=%d\n", ts, rc);
     }
 
-    // ---------- 4) Sleep (in slices) ----------
+    // ---------- 4) sleep slices ----------
     for (int i = 0; i < LOOP_PERIOD_S * 10 && keep_running; i++)
       gpioDelay(100000);
   }
 
   gpioHardwarePWM(IR_PIN, 0, 0);
-  // flush stdin (not necessary)
   if (logf)
     fclose(logf);
   gpioTerminate();
