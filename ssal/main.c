@@ -26,8 +26,8 @@
 #define IR_PIN 18 // use BCM18 (physical pin 12)
 
 // ================== Control (hysteresis) ==================
-#define COOL_ON_C 28.0f
-#define COOL_OFF_C 26.0f
+#define COOL_ON_C 26.0f
+#define COOL_OFF_C 24.0f
 #define REQUIRE_ARMING 1
 
 // Loop period (seconds)
