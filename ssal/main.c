@@ -121,9 +121,9 @@ static int dht22_read(unsigned gpio, float *temp_c, float *rh)
   // Start signal
   gpioSetMode(gpio, PI_OUTPUT);
   gpioWrite(gpio, 0);
-  gpioDelay(18000);
+  gpioDelay(20000);
   gpioWrite(gpio, 1);
-  gpioDelay(40);
+  gpioDelay(80);
 
   // Response
   gpioSetMode(gpio, PI_INPUT);
