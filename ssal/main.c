@@ -1,11 +1,13 @@
 // main.c - RPi 3B+ + DHT22 + pigpio + IR (NEC, POWER TOGGLE only) + CSV logging
-// Adds: non-blocking stdin commands ("test", "nec", "car"),
-//       2-A: longer timeout, 60us threshold, 3x retry with delay,
-//       2-B: request real-time scheduling (SCHED_FIFO).
+// Features:
+// - non-blocking stdin commands: "test", "nec", "car"
+// - DHT hardening: 300ms timeout, 60us threshold, 3x retry @150ms (2-A)
+// - Requests SCHED_FIFO realtime (non-fatal if denied) (2-B)
+// - Hysteresis: ON @26°C, OFF @24°C
+// - Hot-start: if first good reading >= 26°C, send toggle immediately (start fan)
 //
 // Build: make
 // Run:   sudo ./tempctrl
-// (Optionally) sudo chrt -f 80 ./tempctrl  // external RT, if kernel denies in-code set
 
 #include <pigpio.h>
 #include <stdio.h>
@@ -18,7 +20,7 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <ctype.h>
-#include <sched.h> // 2-B: real-time scheduling
+#include <sched.h>
 #include <errno.h>
 
 // ================== Pins (BCM) ==================
@@ -26,29 +28,30 @@
 #define IR_PIN 18 // use BCM18 (physical pin 12)
 
 // ================== Control (hysteresis) ==================
+// UPDATED: ON at 26°C, OFF at 24°C
 #define COOL_ON_C 26.0f
 #define COOL_OFF_C 24.0f
-#define REQUIRE_ARMING 1
+#define REQUIRE_ARMING 1 // keep arming logic, but hot-start overrides when >= COOL_ON_C
 
 // Loop period (seconds)
 #define LOOP_PERIOD_S 2
 
 // ================== DHT22 timing (2-A) ==================
-#define TIMEOUT_US 300000      // was 200000 -> 300000
-#define DHT_THRESHOLD_US 60    // was ~50, safer split between ~28 and ~70
-#define DHT_RETRIES 3          // retry count on failure
-#define DHT_RETRY_DELAY_MS 150 // delay between retries
+#define TIMEOUT_US 300000
+#define DHT_THRESHOLD_US 60
+#define DHT_RETRIES 3
+#define DHT_RETRY_DELAY_MS 150
 
 // ================== NEC IR config ==================
 #define IR_CARRIER_HZ 38000
 #define IR_DUTY_PER_MILL 330000 // ~33% (0..1,000,000)
-#define IR_REPEAT_COUNT 1       // keep a single press for toggle safety
+#define IR_REPEAT_COUNT 1       // single press for toggle safety
 #define IR_REPEAT_GAP_US 40000
 #define USE_NEC_REPEAT_FRAME 0
 
 // ---- FILL THESE WITH YOUR CAPTURED CODES ----
-#define NEC_ADDR 0x00       // <<< put your remote's NEC address
-#define NEC_CMD_TOGGLE 0x02 // <<< put your remote's POWER (toggle)
+#define NEC_ADDR 0x00       // <<< your remote's NEC address
+#define NEC_CMD_TOGGLE 0x02 // <<< your remote's POWER (toggle)
 // ---------------------------------------------
 
 static volatile int keep_running = 1;
@@ -68,7 +71,7 @@ static void iso_timestamp(char *buf, size_t len)
   strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
-// 2-B: request SCHED_FIFO; failure is non-fatal (kernel may deny without CAP_SYS_NICE)
+// ask kernel for RT scheduling (non-fatal)
 static void try_set_realtime(int prio)
 {
   struct sched_param sp;
@@ -163,7 +166,6 @@ static int dht22_read_once(unsigned gpio, float *temp_c, float *rh)
       return -5; // HIGH end
     uint32_t high_len = gpioTick() - start_high;
 
-    // 2-A: threshold relaxed to 60us
     int bit = (high_len > DHT_THRESHOLD_US) ? 1 : 0;
 
     data[i / 8] <<= 1;
@@ -190,7 +192,6 @@ static int dht22_read_once(unsigned gpio, float *temp_c, float *rh)
   return 0;
 }
 
-// 2-A: retry wrapper
 static int dht22_read_retry(unsigned gpio, float *t, float *h)
 {
   int last = -99;
@@ -243,11 +244,9 @@ static inline void carrier_burst_ms(int ms)
 
 static void ir_send_nec_frame(uint8_t addr, uint8_t cmd)
 {
-  // Header
   ir_mark(NEC_HDR_MARK);
   ir_space(NEC_HDR_SPACE);
 
-  // Payload: addr, ~addr, cmd, ~cmd (LSB first)
   uint8_t bytes[4] = {addr, (uint8_t)~addr, cmd, (uint8_t)~cmd};
   for (int b = 0; b < 4; b++)
   {
@@ -307,13 +306,12 @@ int main(void)
     return 1;
   }
 
-  // 2-B: ask kernel for RT scheduling (non-fatal if denied)
-  try_set_realtime(50);
-
+  try_set_realtime(50);           // non-fatal if denied
   gpioSetMode(IR_PIN, PI_OUTPUT); // harmless with hardware PWM
 
   printf("IR cfg: GPIO=%d, carrier=%u Hz, duty=%.1f%%, NEC addr=0x%02X, toggle=0x%02X\n",
          IR_PIN, IR_CARRIER_HZ, IR_DUTY_PER_MILL / 10000.0, NEC_ADDR, NEC_CMD_TOGGLE);
+  printf("Hysteresis: ON >= %.1f°C, OFF <= %.1f°C; Hot-start enabled\n", COOL_ON_C, COOL_OFF_C);
 
   FILE *logf = fopen("log.csv", "a");
   if (!logf)
@@ -360,7 +358,7 @@ int main(void)
       }
     }
 
-    // ---------- 2) sensor read with retry (2-A) ----------
+    // ---------- 2) sensor read with retry ----------
     float t = 0.0f, h = 0.0f;
     int rc = dht22_read_retry(DHT_PIN, &t, &h);
 
@@ -369,14 +367,47 @@ int main(void)
 
     if (rc == 0)
     {
-      // ---------- 3) auto control ----------
+      // ---------- 3) hot-start + arming + hysteresis ----------
       if (!armed)
       {
-        if (t <= COOL_OFF_C)
+        if (t >= COOL_ON_C)
+        {
+          // HOT-START: immediately start fan and arm the controller
+          fan_send_toggle();
+          fan_on = true;
           armed = true;
+          if (logf)
+          {
+            fprintf(logf, "%s,%.1f,%.1f,%d,ARMED_HOT_START\n", ts, t, h, fan_on ? 1 : 0);
+            fflush(logf);
+          }
+          printf("[%s] HOT-START: T=%.1fC >= %.1fC -> FAN=1, ARMED\n", ts, t, COOL_ON_C);
+        }
+        else if (t <= COOL_OFF_C)
+        {
+          // Cold arm without toggling
+          armed = true;
+          if (logf)
+          {
+            fprintf(logf, "%s,%.1f,%.1f,%d,ARMED_COLD\n", ts, t, h, fan_on ? 1 : 0);
+            fflush(logf);
+          }
+          printf("[%s] ARMED_COLD: T=%.1fC <= %.1fC -> FAN stays %d\n", ts, t, COOL_OFF_C, fan_on);
+        }
+        else
+        {
+          // Between OFF and ON bands: wait until crossing
+          if (logf)
+          {
+            fprintf(logf, "%s,%.1f,%.1f,%d,PENDING_ARM\n", ts, t, h, fan_on ? 1 : 0);
+            fflush(logf);
+          }
+          printf("[%s] PENDING_ARM: T=%.1fC (between %.1f and %.1f)\n", ts, t, COOL_OFF_C, COOL_ON_C);
+        }
       }
       else
       {
+        // Normal hysteresis control
         if (!fan_on && t >= COOL_ON_C)
         {
           fan_send_toggle();
@@ -387,16 +418,14 @@ int main(void)
           fan_send_toggle();
           fan_on = false;
         }
-      }
 
-      if (logf)
-      {
-        fprintf(logf, "%s,%.1f,%.1f,%d,%s\n",
-                ts, t, h, fan_on ? 1 : 0, armed ? "OK" : "PENDING_ARM");
-        fflush(logf);
+        if (logf)
+        {
+          fprintf(logf, "%s,%.1f,%.1f,%d,OK\n", ts, t, h, fan_on ? 1 : 0);
+          fflush(logf);
+        }
+        printf("[%s] T=%.1fC, RH=%.1f%% | FAN=%d | OK\n", ts, t, h, fan_on);
       }
-      printf("[%s] T=%.1fC, RH=%.1f%% | FAN=%d | %s\n",
-             ts, t, h, fan_on, armed ? "ARMED" : "PENDING_ARM");
     }
     else
     {
