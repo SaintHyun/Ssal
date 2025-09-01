@@ -48,7 +48,7 @@
 
 // ---- FILL THESE WITH YOUR CAPTURED CODES ----
 #define NEC_ADDR 0x00       // <<< your remote's NEC address (8-bit)
-#define NEC_CMD_TOGGLE 0x02 // <<< your remote's POWER (toggle) (8-bit)
+#define NEC_CMD_TOGGLE 0x45 // <<< your remote's POWER (toggle) (8-bit)
 // ---------------------------------------------
 
 static volatile int keep_running = 1;
